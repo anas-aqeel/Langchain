@@ -41,6 +41,10 @@ if 'current_chat_id' not in st.session_state:
     st.session_state.current_chat_id = None
 if 'vectorstores' not in st.session_state:
     st.session_state.vectorstores = {}
+if 'home_screen' not in st.session_state:
+    st.session_state.home_screen = True
+if 'uploaded_files' not in st.session_state:
+    st.session_state.uploaded_files = {}
 
 # Azure OpenAI configuration
 TOKEN = os.getenv("GITHUB_TOKEN")
@@ -59,10 +63,13 @@ def create_new_chat():
     chat_id = str(uuid.uuid4())
     st.session_state.chats[chat_id] = {
         "title": f"Chat {len(st.session_state.chats) + 1}",
-        "history": []
+        "history": [],
+        "document_name": None,
+        "document_id": None
     }
     st.session_state.current_chat_id = chat_id
     st.query_params["chat"] = chat_id
+    st.session_state.home_screen = False
     return chat_id
 
 
@@ -77,25 +84,23 @@ def save_chats():
                     "context": msg.get("context", [])
                 } for msg in chat_data["history"]
             ],
-            "vectorstore_path": chat_data["vectorstore_path"] if "vectorstore_path" in chat_data else None
+            "document_name": chat_data.get("document_name"),
+            "document_id": chat_data.get("document_id")
         } for chat_id, chat_data in st.session_state.chats.items()
     }
     with open('chats.json', 'w') as f:
         json.dump(serializable_chats, f)
 
 
-def save_document_vectorstore(chat_id, vectorstore):
-    # Save the vectorstore separately (e.g., to a file or different storage)
-    # For example, you can use FAISS's built-in save/load methods to handle this
-    vectorstore.save_local(f'vectorstore_{chat_id}.faiss')
-
-    # Store only the file path or metadata in the JSON (not the actual vectorstore)
-    st.session_state.chats[chat_id]["vectorstore_path"] = f'vectorstore_{
-        chat_id}.faiss'
-
-    # Save chats to the JSON file without vectorstore object
-    with open('chats.json', 'w') as f:
-        json.dump(st.session_state.chats, f)
+def save_document_vectorstore(chat_id, vectorstore, document_name):
+    document_id = str(uuid.uuid4())
+    vectorstore_path = f'vectorstore_{chat_id}_{document_id}.faiss'
+    vectorstore.save_local(vectorstore_path)
+    st.session_state.chats[chat_id]["document_name"] = document_name
+    st.session_state.chats[chat_id]["document_id"] = document_id
+    st.session_state.vectorstores[chat_id] = {document_id: vectorstore}
+    save_chats()
+    return document_id
 
 
 def load_chats():
@@ -105,17 +110,17 @@ def load_chats():
 
 
 def load_document_vectorstore(chat_id):
-    # Load the vectorstore from the saved file path
-    if os.path.exists('chats.json'):
-        with open('chats.json', 'r') as f:
-            chats = json.load(f)
-            if chat_id in chats:
-                vectorstore_path = chats[chat_id].get("vectorstore_path")
-                if vectorstore_path and os.path.exists(vectorstore_path):
-                    vectorstore = FAISS.load_local(
-                        vectorstore_path, embeddings, allow_dangerous_deserialization=True)
-                    st.session_state.vectorstores[chat_id] = vectorstore
-                    return vectorstore
+    if chat_id in st.session_state.chats:
+        document_id = st.session_state.chats[chat_id].get("document_id")
+        if document_id:
+            vectorstore_path = f'vectorstore_{chat_id}_{document_id}.faiss'
+            if os.path.exists(vectorstore_path):
+                vectorstore = FAISS.load_local(
+                    vectorstore_path, embeddings, allow_dangerous_deserialization=True)
+                st.session_state.vectorstores[chat_id] = {
+                    document_id: vectorstore}
+                return vectorstore
+    return None
 
 
 def process_document(file, chat_id):
@@ -131,7 +136,7 @@ def process_document(file, chat_id):
                 if len(pdf_reader.pages) > 100:
                     st.error(
                         "⚠️ PDF exceeds 100 pages. Please upload a smaller PDF.")
-                    return  # Avoid triggering st.rerun() if PDF is too large
+                    return None
                 else:
                     loader = PyPDFLoader(file_path=temp_file_path)
                     data = loader.load()
@@ -139,15 +144,16 @@ def process_document(file, chat_id):
                         chunk_size=3000, chunk_overlap=500)
                     chunks = text_splitter.split_documents(data)
 
-                    st.session_state.vectorstores[chat_id] = FAISS.from_documents(
+                    vectorstore = FAISS.from_documents(
                         documents=chunks, embedding=embeddings)
-                    save_document_vectorstore(
-                        chat_id, st.session_state.vectorstores[chat_id])
-                    st.rerun()
+                    document_id = save_document_vectorstore(
+                        chat_id, vectorstore, file.name)
+                    st.session_state.uploaded_files[chat_id] = file
+                    return document_id
         else:
             st.error(
                 "⚠️ Unsupported file type. Please upload a PDF file.")
-            return
+            return None
 
     finally:
         os.remove(temp_file_path)
@@ -192,7 +198,6 @@ def get_llm_response(user_question, vectorstore):
 # Load existing chats
 load_chats()
 
-
 # Sidebar
 with st.sidebar:
     st.image("assets/logo.jpeg", width=100)
@@ -210,6 +215,7 @@ with st.sidebar:
         if st.button(f"💬 {chat_data['title'][:30]}...", key=chat_id):
             st.session_state.current_chat_id = chat_id
             st.query_params["chat"] = chat_id
+            st.session_state.home_screen = False
             st.rerun()
 
     st.markdown("---")
@@ -217,13 +223,16 @@ with st.sidebar:
         st.session_state.chats = {}
         st.session_state.current_chat_id = None
         st.session_state.vectorstores = {}
+        st.session_state.uploaded_files = {}
+        st.session_state.home_screen = True
         save_chats()
         st.query_params.clear()
         st.rerun()
 
-    if st.button("🆕 New Chat", key="new_chat_bottom"):
-        new_chat_id = create_new_chat()
-        save_chats()
+    if st.button("🏠 Home", key="home_button"):
+        st.session_state.home_screen = True
+        st.session_state.current_chat_id = None
+        st.query_params.clear()
         st.rerun()
 
 # Main content
@@ -234,80 +243,118 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 # Get the chat ID from the URL parameter (if any)
 params = st.query_params
-chat_id = params["chat"] if "chat" in params else None
+chat_id = params.get("chat")
 
 # If a chat ID exists in the URL and is valid, use it
 if chat_id and chat_id in st.session_state.chats:
     st.session_state.current_chat_id = chat_id
-    # Load existing document vecotrstore
+    st.session_state.home_screen = False
+    # Load existing document vectorstore
     load_document_vectorstore(st.session_state.current_chat_id)
 
-# Check if the current chat ID exists and is valid
-if st.session_state.current_chat_id and st.session_state.current_chat_id in st.session_state.chats:
-    current_chat = st.session_state.chats[st.session_state.current_chat_id]
+# Home screen
+if st.session_state.home_screen:
+    st.markdown("""
+    ## Welcome to Majic Chat!
+
+    Majic Chat is an AI-powered document assistant that allows you to upload documents (e.g., PDFs) and ask questions about them.
+
+    ### How to use:
+    1. Click on "New Chat" to start a new conversation.
+    2. Upload a PDF document (max 100 pages).
+    3. Ask questions about the uploaded document.
+    4. The AI will provide answers based on the document's content.
+
+    ### Features:
+    - Upload and analyze PDF documents
+    - Ask questions and get AI-generated responses
+    - Multiple chat sessions
+    - Persistent chat history and document storage
+
+    Get started by clicking "New Chat" in the sidebar!
+    """)
 else:
-    # If no valid chat is found, create a new one
-    new_chat_id = create_new_chat()
-    current_chat = st.session_state.chats[new_chat_id]
+    # Check if the current chat ID exists and is valid
+    if st.session_state.current_chat_id and st.session_state.current_chat_id in st.session_state.chats:
+        current_chat = st.session_state.chats[st.session_state.current_chat_id]
+    else:
+        # If no valid chat is found, create a new one
+        new_chat_id = create_new_chat()
+        current_chat = st.session_state.chats[new_chat_id]
 
-# Display chat title
-st.subheader(f"Chat: {current_chat['title']}")
+    # Display chat title and document name
+    st.subheader(f"Chat: {current_chat['title']}")
+    if current_chat.get('document_name'):
+        st.info(f"📄 Current document: {current_chat['document_name']}")
 
-# File upload section
-uploaded_file = st.file_uploader(
-    "📁 Choose a file (PDF: max 20MB)", type=['pdf'])
+    # File upload section
+    uploaded_file = st.file_uploader(
+        "📁 Choose a file (PDF: max 20MB)",
+        type=['pdf'],
+        key=f"file_uploader_{st.session_state.current_chat_id}_{
+            current_chat.get('document_id', 'new')}"
+    )
 
-# If a file is uploaded and there is no vectorstore for the current chat, process the document
-if uploaded_file and st.session_state.current_chat_id not in st.session_state.vectorstores:
-    process_document(uploaded_file, st.session_state.current_chat_id)
+    # If a file is uploaded, process the document
+    if uploaded_file:
+        document_id = process_document(
+            uploaded_file, st.session_state.current_chat_id)
+        if document_id:
+            st.success(
+                f"Document '{uploaded_file.name}' uploaded successfully!")
+            st.rerun()
 
-# Create a container for chat messages
-chat_container = st.container()
+    # Create a container for chat messages
+    chat_container = st.container()
 
-# Display chat history with user and assistant messages
-with chat_container:
-    for message in current_chat['history']:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-        if message['context']:
-            with st.expander("Show Context", expanded=False):
-                st.write(message["context"])
+    # Display chat history with user and assistant messages
+    with chat_container:
+        for message in current_chat['history']:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+            if message.get('context'):
+                with st.expander("Show Context", expanded=False):
+                    st.write(message["context"])
 
+    # Create a container for the input field and send button
+    input_container = st.container()
 
-# Create a container for the input field and send button
-input_container = st.container()
+    # Add the input field and send button to the container
+    with input_container:
+        if user_input := st.chat_input(placeholder="Enter your question here"):
+            if user_input:
+                if st.session_state.current_chat_id in st.session_state.vectorstores:
+                    document_id = current_chat.get('document_id')
+                    if document_id and document_id in st.session_state.vectorstores[st.session_state.current_chat_id]:
+                        vectorstore = st.session_state.vectorstores[
+                            st.session_state.current_chat_id][document_id]
 
-# Add the input field and send button to the container
-with input_container:
+                        # Store the user message and assistant response in the chat history
+                        current_chat['history'].append(
+                            {"role": "user", "content": user_input})
 
-    if user_input := st.chat_input(placeholder="Enter your question here"):
-        if user_input:
-            if st.session_state.current_chat_id in st.session_state.vectorstores:
-                vectorstore = st.session_state.vectorstores[st.session_state.current_chat_id]
+                        # Get response from LLM and append to chat history
+                        try:
+                            with st.spinner(f"🤔 Thinking... (Gathering answers from {current_chat['document_name']})"):
+                                result, context = get_llm_response(
+                                    user_input, vectorstore)
+                                current_chat['history'].append({
+                                    "role": "assistant",
+                                    "content": result,
+                                    "context": context
+                                })
+                        except Exception as e:
+                            st.error(f"Error retrieving LLM response: {e}")
 
-                # Store the user message and assistant response in the chat history
-                current_chat['history'].append(
-                    {"role": "user", "content": user_input})
-
-                # Get response from LLM and append to chat history
-                try:
-                    with st.spinner("🤔 Thinking..."):
-                        result, context = get_llm_response(
-                            user_input, st.session_state.vectorstores[st.session_state.current_chat_id])
-                        current_chat['history'].append({
-                            "role": "assistant",
-                            "content": result,
-                            "context": context
-                        })
-                except Exception as e:
-                    st.error(f"Error retrieving LLM response: {e}")
-
-                # Save the updated chat history
-                save_chats()
-                st.rerun()
-            else:
-                st.error("No vectorstore found. Please upload a document.")
-
+                        # Save the updated chat history
+                        save_chats()
+                        st.rerun()
+                    else:
+                        st.error(
+                            "Document not found. Please upload a document first.")
+                else:
+                    st.error(
+                        "No document uploaded. Please upload a document first.")
 
 # Save chats on session end
 if st.session_state.current_chat_id:
